@@ -643,7 +643,7 @@ Content\ThirdPersonBP\Blueprints\ThirdPersonGameMode.uasset     SRombauts       
 class FGitLfsLocksParser
 {
 public:
-	FGitLfsLocksParser(const FString& InRepositoryRoot, const FString& InStatus)
+	FGitLfsLocksParser(const FString& InRepositoryRoot, const FString& InStatus, const bool bAbsolutePaths = true)
 	{
 		TArray<FString> Informations;
 		InStatus.ParseIntoArray(Informations, TEXT("\t"), true);
@@ -651,7 +651,10 @@ public:
 		{
 			Informations[0].TrimEndInline(); // Trim whitespace from the end of the filename
 			Informations[1].TrimEndInline(); // Trim whitespace from the end of the username
-			LocalFilename = FPaths::ConvertRelativePathToFull(InRepositoryRoot, Informations[0]);
+			if (bAbsolutePaths)
+				LocalFilename = FPaths::ConvertRelativePathToFull(InRepositoryRoot, Informations[0]);
+			else
+				LocalFilename = Informations[0];
 			LockUser = MoveTemp(Informations[1]);
 		}
 	}
@@ -992,6 +995,22 @@ static void ParseStatusResults(const FString& InPathToGitBinary, const FString& 
 	}
 }
 
+bool GetAllLocks(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool bAbsolutePaths, TArray<FString>& OutErrorMessages, TMap<FString, FString>& OutLocks)
+{
+	TArray<FString> Results;
+	TArray<FString> ErrorMessages;
+	const bool bResult = RunCommand(TEXT("lfs locks"), InPathToGitBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, ErrorMessages);
+	for(const FString& Result : Results)
+	{
+		FGitLfsLocksParser LockFile(InRepositoryRoot, Result, bAbsolutePaths);
+		// TODO LFS Debug log
+		UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
+		OutLocks.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
+	}
+
+	return bResult;
+}
+
 // Run a batch of Git "status" command to update status of given files and/or directories.
 bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InRepositoryRoot, const bool InUsingLfsLocking, const TArray<FString>& InFiles, TArray<FString>& OutErrorMessages, TArray<FGitSourceControlState>& OutStates)
 {
@@ -1001,16 +1020,8 @@ bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InReposito
 	// 0) Issue a "git lfs locks" command at the root of the repository
 	if(InUsingLfsLocking)
 	{
-		TArray<FString> Results;
 		TArray<FString> ErrorMessages;
-		bool bResult = RunCommand(TEXT("lfs locks"), InPathToGitBinary, InRepositoryRoot, TArray<FString>(), TArray<FString>(), Results, ErrorMessages);
-		for(const FString& Result : Results)
-		{
-			FGitLfsLocksParser LockFile(InRepositoryRoot, Result);
-			// TODO LFS Debug log
-			UE_LOG(LogSourceControl, Log, TEXT("LockedFile(%s, %s)"), *LockFile.LocalFilename, *LockFile.LockUser);
-			LockedFiles.Add(MoveTemp(LockFile.LocalFilename), MoveTemp(LockFile.LockUser));
-		}
+		GetAllLocks(InPathToGitBinary, InRepositoryRoot, true, ErrorMessages, LockedFiles);
 	}
 
 	// Git status does not show any "untracked files" when called with files from different subdirectories! (issue #3)
@@ -1082,11 +1093,11 @@ bool RunUpdateStatus(const FString& InPathToGitBinary, const FString& InReposito
 
 			Results.Reset();
 			ErrorMessages.Reset();
-			TArray<FString> ParametersDiff;
-			ParametersDiff.Add(TEXT("--name-only"));
-			ParametersDiff.Add(bDiffAgainstRemote ? FString::Printf(TEXT("origin/%s "), *BranchName) : BranchName);
-			ParametersDiff.Add(TEXT("HEAD"));
-			const bool bResultDiff = RunCommand(TEXT("diff"), InPathToGitBinary, InRepositoryRoot, ParametersDiff, OnePath, Results, ErrorMessages);
+			TArray<FString> ParametersLog;
+			ParametersLog.Add(TEXT("--pretty=")); // this omits the commit lines, just gets us files
+			ParametersLog.Add(TEXT("--name-only"));
+			ParametersLog.Add(bDiffAgainstRemote ? TEXT("HEAD..HEAD@{upstream}") : BranchName);
+			const bool bResultDiff = RunCommand(TEXT("log"), InPathToGitBinary, InRepositoryRoot, ParametersLog, OnePath, Results, ErrorMessages);
 			OutErrorMessages.Append(ErrorMessages);
 			if (bResultDiff)
 			{
@@ -1150,7 +1161,32 @@ bool RunDumpToFile(const FString& InPathToGitBinary, const FString& InRepository
 
 	UE_LOG(LogSourceControl, Log, TEXT("RunDumpToFile: 'git %s'"), *FullCommand);
 
-	FProcHandle ProcessHandle = FPlatformProcess::CreateProc(*InPathToGitBinary, *FullCommand, bLaunchDetached, bLaunchHidden, bLaunchReallyHidden, nullptr, 0, *InRepositoryRoot, PipeWrite);
+    FString PathToGitOrEnvBinary = InPathToGitBinary;
+    #if PLATFORM_MAC
+        // The Cocoa application does not inherit shell environment variables, so add the path expected to have git-lfs to PATH
+        FString PathEnv = FPlatformMisc::GetEnvironmentVariable(TEXT("PATH"));
+        FString GitInstallPath = FPaths::GetPath(InPathToGitBinary);
+
+        TArray<FString> PathArray;
+        PathEnv.ParseIntoArray(PathArray, FPlatformMisc::GetPathVarDelimiter());
+        bool bHasGitInstallPath = false;
+        for (auto Path : PathArray)
+        {
+            if (GitInstallPath.Equals(Path, ESearchCase::CaseSensitive))
+            {
+                bHasGitInstallPath = true;
+                break;
+            }
+        }
+
+        if (!bHasGitInstallPath)
+        {
+            PathToGitOrEnvBinary = FString("/usr/bin/env");
+            FullCommand = FString::Printf(TEXT("PATH=\"%s%s%s\" \"%s\" %s"), *GitInstallPath, FPlatformMisc::GetPathVarDelimiter(), *PathEnv, *InPathToGitBinary, *FullCommand);
+        }
+    #endif
+    
+	FProcHandle ProcessHandle = FPlatformProcess::CreateProc(*PathToGitOrEnvBinary, *FullCommand, bLaunchDetached, bLaunchHidden, bLaunchReallyHidden, nullptr, 0, *InRepositoryRoot, PipeWrite);
 	if(ProcessHandle.IsValid())
 	{
 		FPlatformProcess::Sleep(0.01);
@@ -1439,6 +1475,18 @@ TArray<FString> RelativeFilenames(const TArray<FString>& InFileNames, const FStr
 	}
 
 	return RelativeFiles;
+}
+
+TArray<FString> AbsoluteFilenames(const TArray<FString>& InFileNames, const FString& InRelativeTo)
+{
+	TArray<FString> AbsFiles;
+
+	for(FString FileName : InFileNames) // string copy to be able to convert it inplace
+	{
+		AbsFiles.Add(FPaths::Combine(InRelativeTo, FileName));
+	}
+
+	return AbsFiles;
 }
 
 bool UpdateCachedStates(const TArray<FGitSourceControlState>& InStates)
